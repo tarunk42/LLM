@@ -4,3 +4,4 @@ openwebtext/
 .ipynb_checkpoints/
 /model-01-20000.pkl
 /model-01.pkl
+/.DS_Store
