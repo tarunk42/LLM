@@ -1,0 +1,1062 @@
+# The Code
+
+---
+---
+---
+
+```
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import time
+import numpy as np
+import mmap
+import random
+import pickle
+import argparse
+
+parser = argparse.ArgumentParser(description="This is a demonstration program")
+
+# Here we add an argument to the parser, specifying the expected type, a help message, etc.
+# parser.add_argument('-batch_size', type=str, required=True, help='Please provide a batch_size')
+
+# args = parser.parse_args()
+
+# Now we can use the argument value in our program.
+# print(f'batch size: {args.batch_size}')
+
+device = torch.device("mps")
+print(device)
+
+# batch_size = args.batch_size # to use the batch_size cmd arg -> python file_name.py -batch_size 32
+batch_size = 64
+block_size = 128
+max_iters = 5000
+#eval_interval = 2500
+learning_rate = 3e-4 # 3e-3, 3e-4, 1e-3, 1e-4
+eval_iters = 500
+dropout = 0.2
+n_embd = 384
+n_layer = 8
+n_head = 8
+
+chars = ""
+with open('openwebtext/vocab.txt', 'r', encoding='utf-8') as f:
+    text = f.read()
+    chars = sorted(set(text))
+    
+vocab_size = len(chars)
+
+string_to_int = {ch:i for i, ch in enumerate(chars)}
+int_to_string = {i:ch for i, ch in enumerate(chars)}
+
+# encoding-decoding tokenizer (character level)
+encode = lambda s: [string_to_int[c] for c in s]
+decode = lambda l: ''.join([int_to_string[i] for i in l])
+
+# memory map for using small snippets of text from a single file of any size
+def get_random_chunk(split):
+    filename = "openwebtext/output_train.txt" if split == 'train' else "openwebtext/output_val.txt"
+    with open(filename, 'rb') as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            # Determine the file size and a random position to start reading
+            file_size = len(mm)
+            start_pos = random.randint(0, (file_size) - block_size*batch_size)
+
+            # Seek to the random position and read the block of text
+            mm.seek(start_pos)
+            block = mm.read(block_size*batch_size-1)
+
+            # Decode the block to a string, ignoring any invalid byte sequences
+            decoded_block = block.decode('utf-8', errors='ignore').replace('\r', '')
+            
+            # Train and test splits
+            data = torch.tensor(encode(decoded_block), dtype=torch.long)
+            
+    return data
+
+def get_batch(split):
+    data = get_random_chunk(split)
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i:i+block_size] for i in ix])
+    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    x, y = x.to(device), y.to(device)
+    return x, y
+
+
+@torch.no_grad() # decorator that doesnt allow gradient calc
+def estimate_loss():
+    out = {}
+    model.eval() # dropout is turned off at evaluation
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+
+class Head(nn.Module):
+    """ one head of self-attention """
+    
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5  # (B, T, hs) -> (B, T, T)
+
+        # Dynamically create the lower triangular mask based on the current sequence length
+        tril_mask = torch.tril(torch.ones(T, T, device=x.device))
+        wei = wei.masked_fill(tril_mask == 0, float('-inf'))  # (B, T, T)
+
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+
+        v = self.value(x)  # (B, T, hs)
+        out = wei @ v  # (B, T, T) @ (B, T, hs) -> (B, T, hs)
+        return out
+        
+
+class MultiHeadAttention(nn.Module):
+    """ multiple head of self.attention is parallel """
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(head_size * num_heads, n_embd)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        # (B, T, Feature) --> (B, T, [h1,h1,h1,h1,h2,h2,h2,h2,h3,h3,h3,h3])
+        out = torch.cat([h(x) for h in self.heads], dim=-1) 
+        out = self.dropout(self.proj(out))
+        return out 
+
+class FeedForward(nn.Module):
+    """ a simple linear layer followed by a non-linearity """
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """ Transformer block: communication followed by computation """
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+        
+    def forward(self, x):
+        y = self.sa(x)
+        x = self.ln1(x + y)
+        y = self.ffwd(x)
+        x = self.ln2(x + y)
+        return x
+
+class GPTLanguageModel(nn.Module):
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        
+        self.ln_f = nn.LayerNorm(n_embd) # final norm layer
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+        
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                
+        
+    def forward(self, index, targets=None):
+        B, T = index.shape
+        # idx and targets are both (B, T) tensor of integers
+        tok_emb = self.token_embedding_table(index) #(B,T,C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
+        x = tok_emb + pos_emb
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        
+        
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
+        
+        return logits, loss
+    
+    def generate(self, index, max_new_tokens):
+        # index is (B,T) array of indices in the current context
+        for _ in range(max_new_tokens):
+            # get the predictions
+            logits, loss = self.forward(index)
+            #focus only on the last time step
+            logits = logits[:, -1, :] # becomes (B, C)
+            # apply softmax to get probabilities
+            probs = F.softmax(logits, dim=-1) # (B,C)
+            # sample from the distribution
+            index_next = torch.multinomial(probs, num_samples=1) # (B, 1)
+            # append sample index to the running sequence
+            index = torch.cat((index, index_next), dim=1) # (B, T+1)
+        return index
+
+
+model = GPTLanguageModel(vocab_size)
+print('loading model parameters...')
+with open('model-01-20000.pkl', 'rb') as f:
+    model = pickle.load(f)
+print('loaded successfully!')
+m = model.to(device)
+
+
+# create a PyTorch optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+for iter in range(max_iters):
+    print(iter)
+    if iter % eval_iters == 0:
+        losses = estimate_loss()
+        print(f"step: {iter}, train loss: {losses['train']:.3f}, val loss: {losses['val']:.3f}")
+
+    # sample a batch of data
+    xb, yb = get_batch('train')
+
+    # evaluate the loss
+    logits, loss = model.forward(xb, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+print(loss.item())
+
+with open('model-01-20000.pkl', 'wb') as f:
+    pickle.dump(model, f)
+print('model saved')
+
+
+prompt = 'The devil '
+context = torch.tensor(encode(prompt), dtype=torch.long, device=device)
+generated_chars = decode(m.generate(context.unsqueeze(0), max_new_tokens=150)[0].tolist())
+print(generated_chars)
+
+```
+---
+---
+---
+
+Let’s thoroughly analyze the provided code. The explanation will cover the code itself, its design decisions, and the underlying machine learning concepts. I'll proceed in sections for clarity.
+
+---
+
+### **Imports and Argument Parsing**
+
+```python
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import time
+import numpy as np
+import mmap
+import random
+import pickle
+import argparse
+```
+
+#### **Purpose of Imports**:
+- **`torch` and `torch.nn`**: Core PyTorch library for creating and training neural networks.
+- **`torch.nn.functional`**: Provides operations like activation functions, softmax, and loss functions.
+- **`time` and `random`**: For timing operations and generating random numbers (used in sampling).
+- **`numpy`**: Used for numerical operations, though its use here is minimal.
+- **`mmap`**: Enables efficient handling of large files by mapping them into memory without fully loading them.
+- **`pickle`**: For saving and loading Python objects (here, the model's state).
+- **`argparse`**: Handles command-line arguments, though it’s not actively used in the script.
+
+---
+
+### **Device Setup**
+
+```python
+device = torch.device("mps")
+print(device)
+```
+
+- **Purpose**: Specifies the device (CPU, GPU, or Metal Performance Shaders for Apple devices) on which computations will run.
+- **`torch.device("mps")`**: MPS stands for Metal Performance Shaders, used for PyTorch acceleration on macOS.
+
+---
+
+### **Hyperparameters**
+
+```python
+batch_size = 64
+block_size = 128
+max_iters = 5000
+learning_rate = 3e-4
+eval_iters = 500
+dropout = 0.2
+n_embd = 384
+n_layer = 8
+n_head = 8
+```
+
+- **`batch_size`**: Number of training examples processed in one forward and backward pass.
+- **`block_size`**: Length of context (sequence) used in training, defining how far back the model looks.
+- **`max_iters`**: Total number of iterations for training.
+- **`learning_rate`**: Step size for the optimizer, controlling how much weights are updated.
+- **`eval_iters`**: Number of iterations for loss estimation during evaluation.
+- **`dropout`**: Regularization technique to prevent overfitting by randomly deactivating neurons.
+- **`n_embd`, `n_layer`, `n_head`**: Model parameters for the size of embeddings, number of transformer layers, and number of attention heads.
+
+---
+
+### **Vocabulary Preparation**
+
+```python
+chars = ""
+with open('openwebtext/vocab.txt', 'r', encoding='utf-8') as f:
+    text = f.read()
+    chars = sorted(set(text))
+
+vocab_size = len(chars)
+
+string_to_int = {ch:i for i, ch in enumerate(chars)}
+int_to_string = {i:ch for i, ch in enumerate(chars)}
+
+# encoding-decoding tokenizer (character level)
+encode = lambda s: [string_to_int[c] for c in s]
+decode = lambda l: ''.join([int_to_string[i] for i in l])
+```
+
+#### **Explanation**:
+1. **`openwebtext/vocab.txt`**: Expected to contain all unique characters in the training text corpus.
+2. **`chars`**: List of all unique characters, sorted for consistent indexing.
+3. **`vocab_size`**: Number of unique characters, defining the size of the model's output layer.
+4. **Character Tokenizer**:
+   - **`encode`**: Converts a string (sequence of characters) into a list of integers representing indices in `chars`.
+   - **`decode`**: Converts a list of integers back into a string.
+
+---
+
+### **Efficient File Handling with `mmap`**
+
+```python
+def get_random_chunk(split):
+    filename = "openwebtext/output_train.txt" if split == 'train' else "openwebtext/output_val.txt"
+    with open(filename, 'rb') as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            file_size = len(mm)
+            start_pos = random.randint(0, (file_size) - block_size * batch_size)
+
+            mm.seek(start_pos)
+            block = mm.read(block_size * batch_size - 1)
+            decoded_block = block.decode('utf-8', errors='ignore').replace('\r', '')
+            
+            data = torch.tensor(encode(decoded_block), dtype=torch.long)
+    return data
+```
+
+#### **Purpose**:
+Efficiently reads random chunks of data from a large file without loading the entire file into memory.
+
+1. **`mmap`**:
+   - Maps a file directly into memory, allowing efficient random access.
+2. **`random.randint`**:
+   - Chooses a random starting position for reading a chunk of text.
+3. **`block_size * batch_size`**:
+   - Specifies the size of the data chunk to read (context length × number of examples).
+4. **Decoding**:
+   - The binary data is converted to a UTF-8 string, and invalid characters are ignored.
+
+---
+
+### **Data Batching**
+
+```python
+def get_batch(split):
+    data = get_random_chunk(split)
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i:i+block_size] for i in ix])
+    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    x, y = x.to(device), y.to(device)
+    return x, y
+```
+
+1. **`get_random_chunk(split)`**:
+   - Provides a large chunk of data.
+2. **`torch.randint`**:
+   - Randomly selects starting indices for `batch_size` samples.
+3. **`x` and `y`**:
+   - **`x`**: Input sequence (e.g., characters 0–127).
+   - **`y`**: Target sequence (e.g., characters 1–128, shifted by one position).
+4. **`to(device)`**:
+   - Moves tensors to the specified device (CPU/GPU/MPS).
+
+---
+
+### **Loss Estimation**
+
+```python
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+```
+
+#### **Key Concepts**:
+1. **`@torch.no_grad()`**:
+   - Disables gradient computation for efficiency during evaluation.
+2. **`model.eval()`**:
+   - Switches the model to evaluation mode, disabling features like dropout.
+3. **`get_batch(split)`**:
+   - Provides batches of data for the specified split (`train` or `val`).
+4. **`logits, loss = model(X, Y)`**:
+   - Forward pass of the model to compute predictions and loss.
+5. **Loss Averaging**:
+   - Accumulates the average loss over `eval_iters` batches.
+
+---
+
+
+Here’s the detailed explanation of the `Head` class, followed by a breakdown of the `MultiHeadAttention` implementation.
+
+---
+
+### **Attention Head: The `Head` Class**
+
+```python
+class Head(nn.Module):
+    """One head of self-attention"""
+    
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)  # Compute key vectors (B, T, head_size)
+        q = self.query(x)  # Compute query vectors (B, T, head_size)
+        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5  # Scaled dot-product (B, T, T)
+        
+        # Dynamically create the lower triangular mask based on the sequence length
+        tril_mask = torch.tril(torch.ones(T, T, device=x.device))  # Lower triangular mask
+        wei = wei.masked_fill(tril_mask == 0, float('-inf'))  # Mask future positions
+        wei = F.softmax(wei, dim=-1)  # Normalize over the time axis (B, T, T)
+        wei = self.dropout(wei)  # Apply dropout to attention weights
+        
+        v = self.value(x)  # Compute value vectors (B, T, head_size)
+        out = wei @ v  # Weighted sum of values (B, T, head_size)
+        return out
+```
+
+---
+
+### **Explanation of the `Head` Class**
+
+#### **Purpose**:
+The `Head` class implements one attention "head," which is a core component of the transformer. A head computes attention scores and uses them to focus on relevant parts of the input.
+
+#### **Components**:
+1. **Key, Query, Value Projections**:
+   - The inputs are transformed into **keys**, **queries**, and **values** using linear layers. These transformations prepare the data for attention computation.
+   - **Shapes**:
+     - `k` (key): `(B, T, head_size)`
+     - `q` (query): `(B, T, head_size)`
+     - `v` (value): `(B, T, head_size)`
+
+2. **Attention Scores (`wei`)**:
+   - **Scaled Dot-Product Attention**:
+     - Compute `q @ k.T`, where `k.T` transposes the last two dimensions.
+     - Scale by \( \sqrt{\text{head\_size}} \) for numerical stability.
+   - **Shape**: `(B, T, T)`, representing attention scores between every pair of positions in the sequence.
+
+3. **Causal Masking**:
+   - Ensures that each position in the sequence only attends to itself and earlier positions (not future ones).
+   - Achieved by applying a lower triangular mask (`tril_mask`) that sets future positions to \(-\infty\) before softmax.
+
+4. **Softmax**:
+   - Converts attention scores into probabilities (values between 0 and 1).
+
+5. **Dropout**:
+   - Regularizes the attention weights to prevent overfitting.
+
+6. **Weighted Sum of Values**:
+   - The attention probabilities (`wei`) weight the value vectors (`v`), producing the output.
+
+---
+
+### **Multi-Head Attention: The `MultiHeadAttention` Class**
+
+```python
+class MultiHeadAttention(nn.Module):
+    """Multiple heads of self-attention running in parallel"""
+    
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(head_size * num_heads, n_embd)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        # Apply each head in parallel and concatenate their outputs
+        out = torch.cat([h(x) for h in self.heads], dim=-1)  # (B, T, head_size * num_heads)
+        out = self.dropout(self.proj(out))  # Project back to original embedding size
+        return out
+```
+
+---
+
+### **Explanation of `MultiHeadAttention`**
+
+#### **Purpose**:
+Combines multiple attention heads, allowing the model to focus on different aspects of the input simultaneously.
+
+#### **Components**:
+1. **Multiple Attention Heads**:
+   - `self.heads` is a list of `Head` instances, each computing its own attention independently.
+   - The number of heads (`num_heads`) allows the model to capture diverse relationships in the input.
+
+2. **Concatenation**:
+   - Outputs of all heads are concatenated along the feature dimension.
+   - Shape after concatenation: `(B, T, head_size * num_heads)`.
+
+3. **Projection (`proj`)**:
+   - A linear layer projects the concatenated output back to the model's embedding size (`n_embd`).
+
+4. **Dropout**:
+   - Regularizes the final attention output.
+
+---
+
+### **Key Concept: Multi-Head Attention in Transformers**
+- Allows the model to focus on multiple types of relationships within the input simultaneously (e.g., positional dependencies, word co-occurrence).
+- Each head learns a different attention pattern, capturing varied relationships.
+
+---
+
+Let’s continue with a detailed explanation of the next components: `FeedForward`, `Block`, and `GPTLanguageModel`.
+
+---
+
+### **Feed-Forward Network: `FeedForward` Class**
+
+```python
+class FeedForward(nn.Module):
+    """A simple linear layer followed by a non-linearity"""
+    
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),  # Expand embedding size by 4x
+            nn.ReLU(),                     # Apply non-linearity
+            nn.Linear(4 * n_embd, n_embd), # Reduce back to embedding size
+            nn.Dropout(dropout)            # Apply dropout
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+```
+
+---
+
+#### **Explanation of the `FeedForward` Class**
+
+1. **Purpose**:
+   - Implements the feed-forward sublayer of a transformer block.
+   - Adds non-linearity to the model, which helps in learning complex representations.
+
+2. **Components**:
+   - **`Linear` layers**:
+     - The first `Linear` layer expands the input size to 4 times the embedding size (`4 * n_embd`).
+     - The second `Linear` layer reduces it back to the original embedding size (`n_embd`).
+   - **ReLU**:
+     - A non-linear activation function, introducing non-linearity into the model.
+   - **Dropout**:
+     - Regularization technique to randomly deactivate neurons and prevent overfitting.
+
+3. **Why Expand and Reduce?**
+   - Expanding the embedding size allows the model to capture richer feature interactions.
+   - Reducing back ensures that the final output has the same dimensionality as the input.
+
+---
+
+### **Transformer Block: `Block` Class**
+
+```python
+class Block(nn.Module):
+    """Transformer block: communication followed by computation"""
+    
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)  # Self-attention
+        self.ffwd = FeedForward(n_embd)                 # Feed-forward layer
+        self.ln1 = nn.LayerNorm(n_embd)                 # Layer normalization
+        self.ln2 = nn.LayerNorm(n_embd)                 # Layer normalization
+    
+    def forward(self, x):
+        # Self-attention layer with residual connection
+        y = self.sa(x)
+        x = self.ln1(x + y)  # Add residual connection and normalize
+        
+        # Feed-forward layer with residual connection
+        y = self.ffwd(x)
+        x = self.ln2(x + y)  # Add residual connection and normalize
+        
+        return x
+```
+
+---
+
+#### **Explanation of the `Block` Class**
+
+1. **Purpose**:
+   - Combines self-attention and feed-forward layers with residual connections and normalization to form a single transformer block.
+
+2. **Components**:
+   - **Self-Attention (`sa`)**:
+     - A `MultiHeadAttention` instance handles communication between tokens in the sequence.
+   - **Feed-Forward (`ffwd`)**:
+     - A `FeedForward` instance performs computation on each token's features independently.
+   - **Layer Normalization (`ln1`, `ln2`)**:
+     - Ensures stable training by normalizing inputs to have zero mean and unit variance.
+   - **Residual Connections**:
+     - Adds the input of a sublayer back to its output, allowing gradient flow through the network and improving optimization.
+
+3. **Flow**:
+   - Input → Self-Attention → Residual + LayerNorm → FeedForward → Residual + LayerNorm → Output.
+
+---
+
+### **GPT Language Model: `GPTLanguageModel` Class**
+
+```python
+class GPTLanguageModel(nn.Module):
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)  # Token embeddings
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)  # Positional embeddings
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)  # Final layer normalization
+        self.lm_head = nn.Linear(n_embd, vocab_size)  # Maps to vocab size
+        
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                
+    def forward(self, index, targets=None):
+        B, T = index.shape
+        tok_emb = self.token_embedding_table(index)  # Token embeddings (B, T, C)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # Positional embeddings (T, C)
+        x = tok_emb + pos_emb  # Combine token and positional embeddings
+        x = self.blocks(x)  # Pass through transformer blocks
+        x = self.ln_f(x)  # Apply final layer normalization
+        logits = self.lm_head(x)  # Map to vocab size
+        
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B * T, C)
+            targets = targets.view(B * T)
+            loss = F.cross_entropy(logits, targets)  # Compute loss
+        
+        return logits, loss
+    
+    def generate(self, index, max_new_tokens):
+        for _ in range(max_new_tokens):
+            logits, loss = self.forward(index)
+            logits = logits[:, -1, :]  # Focus on the last token
+            probs = F.softmax(logits, dim=-1)  # Compute probabilities
+            index_next = torch.multinomial(probs, num_samples=1)  # Sample next token
+            index = torch.cat((index, index_next), dim=1)  # Append sampled token
+        return index
+```
+
+---
+
+#### **Explanation of the `GPTLanguageModel` Class**
+
+1. **Purpose**:
+   - Implements a GPT-style transformer for autoregressive language modeling.
+
+2. **Components**:
+   - **Embeddings**:
+     - `token_embedding_table`: Maps tokens to dense vectors of size `n_embd`.
+     - `position_embedding_table`: Adds positional information to embeddings.
+   - **Transformer Blocks**:
+     - A sequence of `Block` instances processes the embeddings.
+   - **Layer Normalization**:
+     - Applied after the transformer blocks to stabilize training.
+   - **Output Head (`lm_head`)**:
+     - Maps the final representations to vocabulary size for token prediction.
+
+3. **Forward Pass**:
+   - Combines token and positional embeddings.
+   - Passes through multiple transformer blocks.
+   - Outputs logits for each token position.
+   - Computes loss if targets are provided.
+
+4. **Text Generation**:
+   - Uses the `generate` method to iteratively predict tokens, sampling from the model's output probabilities.
+
+---
+
+Let’s continue with the training loop, loss evaluation, model saving/loading, and text generation. These sections complete the workflow for training and utilizing the GPT model.
+
+---
+
+### **Training Loop**
+
+```python
+for iter in range(max_iters):
+    print(iter)
+    if iter % eval_iters == 0:
+        losses = estimate_loss()
+        print(f"step: {iter}, train loss: {losses['train']:.3f}, val loss: {losses['val']:.3f}")
+
+    # Sample a batch of data
+    xb, yb = get_batch('train')
+
+    # Evaluate the loss
+    logits, loss = model.forward(xb, yb)
+    optimizer.zero_grad(set_to_none=True)  # Clear gradients
+    loss.backward()  # Backpropagation
+    optimizer.step()  # Update parameters
+print(loss.item())
+```
+
+---
+
+#### **Explanation of the Training Loop**
+
+1. **Iterations (`for iter in range(max_iters)`)**:
+   - The training process iterates `max_iters` times.
+
+2. **Loss Evaluation (`estimate_loss`)**:
+   - Every `eval_iters` iterations, the training and validation loss are estimated using the `estimate_loss` function. This provides feedback on the model's progress.
+
+3. **Batch Sampling (`get_batch`)**:
+   - Samples a batch of training data (`xb` and `yb`).
+
+4. **Forward Pass**:
+   - The model computes predictions (`logits`) and loss for the batch.
+
+5. **Backward Pass**:
+   - **`loss.backward()`**: Computes gradients for all trainable parameters using backpropagation.
+   - **`optimizer.zero_grad(set_to_none=True)`**: Clears previous gradients to avoid accumulation.
+   - **`optimizer.step()`**: Updates the model's parameters based on the computed gradients.
+
+6. **Monitoring**:
+   - Every `eval_iters` iterations, the loss values are printed to monitor the training progress.
+
+---
+
+### **Optimizer Initialization**
+
+```python
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+```
+
+- **`AdamW` Optimizer**:
+  - A variant of the Adam optimizer with decoupled weight decay for better regularization.
+  - Optimizes the model's parameters based on gradients.
+
+- **Learning Rate**:
+  - Set by the `learning_rate` hyperparameter, which controls the step size for parameter updates.
+
+---
+
+### **Model Saving**
+
+```python
+with open('model-01-20000.pkl', 'wb') as f:
+    pickle.dump(model, f)
+print('model saved')
+```
+
+1. **Saving the Model**:
+   - The model's state is saved to a file (`model-01-20000.pkl`) using Python's `pickle` module.
+   - This allows the model to be reloaded later for inference or continued training.
+
+---
+
+### **Model Loading**
+
+```python
+print('loading model parameters...')
+with open('model-01-20000.pkl', 'rb') as f:
+    model = pickle.load(f)
+print('loaded successfully!')
+m = model.to(device)
+```
+
+1. **Loading the Model**:
+   - The previously saved model file is loaded using `pickle`.
+   - The model is moved to the specified computation device (`device`).
+
+---
+
+### **Text Generation**
+
+```python
+prompt = 'The devil '
+context = torch.tensor(encode(prompt), dtype=torch.long, device=device)
+generated_chars = decode(m.generate(context.unsqueeze(0), max_new_tokens=150)[0].tolist())
+print(generated_chars)
+```
+
+#### **Text Generation Workflow**
+
+1. **Input Prompt**:
+   - A user-provided string (e.g., `"The devil "`) serves as the initial context for generation.
+
+2. **Encoding**:
+   - The prompt is tokenized using the `encode` function, converting it into a sequence of integers.
+
+3. **Input Preparation**:
+   - The encoded context is wrapped in a tensor and expanded with `unsqueeze(0)` to match the model's expected input shape `(B, T)`.
+
+4. **Generation (`generate` method)**:
+   - The model iteratively predicts tokens:
+     - For each step:
+       - Compute logits for the current context.
+       - Extract the logits of the last token in the sequence.
+       - Apply softmax to convert logits into probabilities.
+       - Sample the next token based on the probabilities.
+       - Append the new token to the context.
+   - The process repeats for `max_new_tokens` iterations.
+
+5. **Decoding**:
+   - The generated sequence is converted back into a human-readable string using the `decode` function.
+
+6. **Output**:
+   - The final generated text is printed.
+
+---
+
+### **Summary of the Workflow**
+
+1. **Preparation**:
+   - Hyperparameters, vocabulary, and model architecture are defined.
+   - Training and validation datasets are prepared.
+
+2. **Training**:
+   - The model is trained using a batch of data in each iteration.
+   - Loss is computed, backpropagated, and parameters are updated.
+
+3. **Evaluation**:
+   - Loss is evaluated on both training and validation data to monitor progress.
+
+4. **Model Persistence**:
+   - The model can be saved and loaded for future use.
+
+5. **Text Generation**:
+   - The trained model generates text based on a user-provided prompt.
+
+---
+
+This completes the explanation of the code! 
+
+---
+
+### Theoretical Breakdown of GPT Architecture and Workflow
+
+The GPT (Generative Pre-trained Transformer) architecture is based on the Transformer model introduced by Vaswani et al. in 2017. It is designed for autoregressive sequence modeling, where the model generates text by predicting the next token given a sequence of previous tokens.
+
+Below, I will explain the core concepts and steps behind GPT in a structured and technical way.
+
+---
+
+#### **1. Data Representation: Tokens and Embeddings**
+
+- **Tokens**: The smallest units of text the model understands. In character-level models (like the provided code), each character is treated as a token. In word- or subword-level models, tokens are words or parts of words (e.g., "un-", "real-", "istic").
+  - Example: The string `"hello"` would be tokenized into `[h, e, l, l, o]` in a character-level model or `[hello]` in a word-level model.
+
+- **Vocabulary**: A fixed set of tokens that the model can handle. Each token in the vocabulary is mapped to a unique index.
+
+- **Embedding**: Tokens are mapped to dense vectors of fixed dimensions. These vectors capture semantic meaning in continuous space. For example, the word "king" might have an embedding close to "queen" in some dimensions but far from "apple."
+
+---
+
+#### **2. Sequence Modeling with Transformers**
+
+The GPT model processes sequences of tokens using a **Transformer architecture**, which relies on self-attention mechanisms to model relationships between tokens.
+
+##### **Key Components of Transformers**:
+
+1. **Self-Attention**:
+   - A mechanism that allows each token in a sequence to focus on other tokens.
+   - Tokens compute a weighted combination of other tokens based on their importance. For example, in the sentence "The cat sat on the mat," the word "cat" might pay more attention to "sat" and "mat."
+
+2. **Positional Encoding**:
+   - Transformers process sequences as unordered sets of tokens. To handle sequence order, positional encodings are added to token embeddings. These encodings ensure that the model understands the order in which tokens appear.
+
+3. **Residual Connections and Layer Normalization**:
+   - Residual connections allow gradients to flow directly from deeper layers to earlier layers, improving optimization. Layer normalization stabilizes training by ensuring consistent input statistics.
+
+4. **Feed-Forward Networks**:
+   - Linear transformations with non-linear activations (e.g., ReLU). These layers process token representations after self-attention.
+
+---
+
+#### **3. GPT's Autoregressive Nature**
+
+- GPT models text generation as a left-to-right process. At each step, the model predicts the next token based only on previously seen tokens.
+- Example: Given "The cat sat," the model predicts "on." Once "on" is generated, it predicts the next token ("the"), and so on.
+
+##### **Differences from Bidirectional Models**:
+- Unlike models like BERT, which consider both past and future tokens during training, GPT only looks at past tokens. This is critical for generation tasks, where future tokens are unknown.
+
+---
+
+#### **4. GPT Model Architecture**
+
+The GPT architecture is composed of stacked **Transformer blocks**, each containing:
+1. **Multi-Head Self-Attention**:
+   - Multiple attention heads allow the model to focus on different aspects of the sequence.
+   - Example: One head might focus on grammatical structure, while another focuses on semantic meaning.
+   
+2. **Feed-Forward Layer**:
+   - Captures token-level features and interactions.
+
+3. **Layer Normalization and Residual Connections**:
+   - Ensures stability and gradient flow during training.
+
+At the top, a final linear layer maps the transformer outputs to vocabulary logits, and a softmax layer converts these logits into probabilities for the next token.
+
+---
+
+#### **5. Data Preparation**
+
+1. **Tokenization**:
+   - Converts raw text into sequences of token indices.
+
+2. **Contextualization**:
+   - Training data is prepared as input-output pairs where the input is a sequence of tokens (e.g., "The cat sat") and the output is the next token (e.g., "on").
+
+3. **Batching**:
+   - Sequences are grouped into batches for parallel processing. Each batch contains multiple input-output pairs.
+
+---
+
+#### **6. Training Process**
+
+1. **Objective**:
+   - The model is trained to minimize the **cross-entropy loss**, which measures the difference between predicted token probabilities and the actual token.
+
+2. **Steps**:
+   - **Forward Pass**: The model predicts the next token for each sequence in a batch.
+   - **Loss Computation**: Loss is calculated based on the predictions and actual tokens.
+   - **Backward Pass**: Gradients of the loss with respect to model parameters are computed using backpropagation.
+   - **Parameter Update**: Gradients are used to update model parameters via an optimizer (e.g., AdamW).
+
+---
+
+#### **7. Text Generation**
+
+1. **Seed Input**:
+   - A prompt (e.g., "The cat sat") serves as the initial input.
+
+2. **Iterative Prediction**:
+   - The model generates one token at a time, appending each predicted token to the input context.
+
+3. **Probabilistic Sampling**:
+   - Instead of always picking the most probable token, sampling from the token distribution allows for more diverse outputs. Techniques like **temperature scaling** or **top-k sampling** control randomness.
+
+---
+
+#### **8. Scaling and Performance**
+
+1. **Hyperparameters**:
+   - Embedding size, number of layers, attention heads, and dropout are key design choices. Larger models capture more complexity but require more computation and memory.
+
+2. **Optimization**:
+   - Techniques like gradient clipping and learning rate schedules are used to stabilize training.
+
+3. **Regularization**:
+   - Dropout reduces overfitting by randomly disabling parts of the network during training.
+
+---
+
+#### **9. Strengths and Limitations**
+
+1. **Strengths**:
+   - **Context-Awareness**: GPT can capture long-range dependencies between tokens.
+   - **Generalization**: Pre-training on large corpora allows for fine-tuning on specific tasks with minimal labeled data.
+
+2. **Limitations**:
+   - **Context Length**: Limited by the fixed sequence length during training.
+   - **Autoregressive Bottleneck**: Sequential generation can be slow for long outputs.
+   - **Bias**: Models inherit biases present in the training data.
+
+---
+
+#### **10. Applications**
+
+1. **Language Modeling**:
+   - Predict the next word in a sentence.
+
+2. **Text Completion**:
+   - Finish a given prompt.
+
+3. **Translation**:
+   - Generate text in a different language based on input.
+
+4. **Creative Writing**:
+   - Produce poetry, stories, or dialogue.
+
+---
+
+This explanation covers the theoretical concepts behind GPT and its workflow, diving into the model's structure, training, and text generation principles. 
+
+---
+
+
